@@ -1,0 +1,20 @@
+[package]
+name = "gfaphaser"
+version = "0.2.0"
+edition = "2021"
+
+[lib]
+name = "gfaphaser"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gfa_split"
+path = "src/bin/gfa_split.rs"
+
+[[bin]]
+name = "gfa_haps"
+path = "src/bin/gfa_haps.rs"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
