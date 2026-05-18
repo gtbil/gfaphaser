@@ -13,7 +13,7 @@ path = "src/bin/gfa_split.rs"
 
 [[bin]]
 name = "gfa_haps"
-path = "src/bin/gfa_haps.rs"
+path = "src/bin/gfa_haps/main.rs"
 
 [profile.release]
 opt-level = 3
