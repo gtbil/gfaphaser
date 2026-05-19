@@ -31,6 +31,23 @@ use gfaphaser::{
     Side, Step, Walk,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::rc::Rc;
+
+// BFS parent table keyed by halfedge(node, exit_side).
+// Values are Rc so "cloning" a cached entry is O(1) (just a refcount bump),
+// not a deep copy of the O(N) parent vector.
+type BfsEntry = Rc<Vec<Option<(usize, u64, String)>>>;
+type BfsCache = HashMap<usize, BfsEntry>;
+
+fn get_bfs(g: &Graph, cache: &mut BfsCache, node: usize, exit_side: Side) -> BfsEntry {
+    let key = halfedge(node, exit_side);
+    if let Some(v) = cache.get(&key) {
+        return Rc::clone(v);
+    }
+    let v = Rc::new(bfs_from(g, node, exit_side));
+    cache.insert(key, Rc::clone(&v));
+    v
+}
 use std::env;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -215,152 +232,135 @@ fn entry_state_of(walk: &Walk, i: usize) -> (usize, Side) {
 /// Attempt to splice node `target` into `walk` such that walk visits target
 /// somewhere. Returns Some(new_walk) on success, None if no splice found.
 ///
-/// We try every (i, j) split where 0 <= i < j <= len-1, finding a path from
-/// exit-state-after(i) through `target` to entry-state-of(j). If multiple
-/// splices succeed, return the one with the fewest *new revisits* (nodes
-/// added to the walk that were already present in the walk).
-fn try_splice(g: &Graph, walk: &Walk, target: usize, max_extra_revisits: usize) -> Option<Walk> {
+/// Searches in order of increasing gap (j - i) so that short detours are
+/// found first. A short splice replaces few existing steps, preserving the
+/// overall walk structure and reducing the risk of evicting nodes that are
+/// only covered by this walk. We return as soon as the first valid splice
+/// is found — no need to scan all pairs.
+///
+/// Complexity: O(G × n_steps) BFS lookups (O(1) each from cache) where G
+/// is the gap of the first valid splice found. Path reconstruction and walk
+/// building are O(path_len) and happen only for the winning pair.
+fn try_splice(
+    g: &Graph,
+    walk: &Walk,
+    target: usize,
+    max_extra_revisits: usize,
+    bfs_cache: &mut BfsCache,
+) -> Option<Walk> {
     let n_steps = walk.steps.len();
-    if n_steps < 1 {
+    if n_steps < 2 {
         return None;
     }
 
-    // Pre-build BFS from each step's exit state (memoize across i's).
-    let mut bfs_cache: HashMap<usize, Vec<Option<(usize, u64, String)>>> = HashMap::new();
-
     let original_nodes: HashSet<usize> = walk.steps.iter().map(|s| s.node).collect();
 
-    let mut best: Option<(Walk, usize)> = None;
+    // Precompute: for each target_entry side (0 or 1), the set of walk step
+    // indices j whose entry state is reachable from target's exit. Stored as
+    // HashSets for O(1) per-j filter inside the gap loop.
+    let reachable_j: [HashSet<usize>; 2] = [0u8, 1u8].map(|te| {
+        let parents_from_t = get_bfs(g, bfs_cache, target, 1 - te);
+        (0..n_steps)
+            .filter(|&j| {
+                let (b_node, b_entry) = entry_state_of(walk, j);
+                parents_from_t[halfedge(b_node, 1 - b_entry)].is_some()
+            })
+            .collect::<HashSet<usize>>()
+    });
 
-    // Helper that gets or computes a BFS result, returning a clone of the vec.
-    // (Cloning is acceptable here: per call site we do small amounts of work
-    // on the result and the per-component BFS is cheap relative to candidate
-    // generation.)
-    fn get_bfs(
-        g: &Graph,
-        cache: &mut HashMap<usize, Vec<Option<(usize, u64, String)>>>,
-        node: usize,
-        exit_side: Side,
-    ) -> Vec<Option<(usize, u64, String)>> {
-        let key = halfedge(node, exit_side);
-        if let Some(v) = cache.get(&key) {
-            return v.clone();
-        }
-        let v = bfs_from(g, node, exit_side);
-        cache.insert(key, v.clone());
-        v
+    // If target can reach no step j at all, bail immediately.
+    if reachable_j[0].is_empty() && reachable_j[1].is_empty() {
+        return None;
     }
 
-    for i in 0..n_steps {
-        let (a_node, a_exit) = exit_state_after(walk, i);
-        let parents_fwd = get_bfs(g, &mut bfs_cache, a_node, a_exit);
-
-        for target_entry in [0u8, 1u8] {
-            let target_exit_state = halfedge(target, 1 - target_entry);
-            if parents_fwd[target_exit_state].is_none() {
-                continue;
-            }
-            let path_to_target = match reconstruct_path(&parents_fwd, target_exit_state) {
-                Some(p) => p,
-                None => continue,
-            };
-            let parents_from_t = get_bfs(g, &mut bfs_cache, target, 1 - target_entry);
-
-            for j in (i + 1)..n_steps {
-                let (b_node, b_entry) = entry_state_of(walk, j);
-                let target_he = halfedge(b_node, 1 - b_entry);
-                if parents_from_t[target_he].is_none() {
+    // Scan increasing gap values. For gap g, try all (i, j = i+g) pairs.
+    // Short splices are less disruptive so we prefer them by trying first.
+    for gap in 1..n_steps {
+        for i in 0..(n_steps - gap) {
+            let j = i + gap;
+            for target_entry in [0u8, 1u8] {
+                // O(1) filter: j reachable from target?
+                if !reachable_j[target_entry as usize].contains(&j) {
                     continue;
                 }
+                // O(1) filter: target reachable from walk[i]'s exit?
+                let (a_node, a_exit) = exit_state_after(walk, i);
+                let parents_fwd = get_bfs(g, bfs_cache, a_node, a_exit);
+                let target_exit_state = halfedge(target, 1 - target_entry);
+                if parents_fwd[target_exit_state].is_none() {
+                    continue;
+                }
+
+                // Both reachable — reconstruct paths and check revisit budget.
+                let path_to_target = match reconstruct_path(&parents_fwd, target_exit_state) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let parents_from_t = get_bfs(g, bfs_cache, target, 1 - target_entry);
+                let (b_node, b_entry) = entry_state_of(walk, j);
+                let target_he = halfedge(b_node, 1 - b_entry);
                 let path_from_target = match reconstruct_path(&parents_from_t, target_he) {
                     Some(p) => p,
                     None => continue,
                 };
 
-                let mut detour_combined: Vec<(usize, Side, u64, String)> =
-                    path_to_target.clone();
-                detour_combined.extend(path_from_target.iter().skip(1).cloned());
-
-                let detour_steps = path_to_steps(g, &detour_combined);
-
-                // The last entry of detour_combined is the state (b_node,
-                // 1 - b_entry) -- i.e., "we just entered b_node on b_entry,
-                // about to exit". That state IS walk.steps[j]: same node,
-                // same entry side, so same orientation. We must therefore
-                // skip walk.steps[j] when rebuilding, otherwise it appears
-                // twice (an adjacent duplicate, which breaks Bandage and
-                // produces an invalid walk).
-                //
-                // We also need to preserve walk.steps[j]'s overlap_in for the
-                // detour's last step, since that overlap is what bridges to
-                // the splice point. Actually no -- the detour's last step
-                // already carries the correct overlap from path_from_target's
-                // final edge, which is the edge we actually traverse in the
-                // spliced walk. walk.steps[j].overlap_in was the overlap in
-                // the *original* walk (from j-1 to j), which no longer
-                // applies after splicing.
-
-                let mut seen: HashSet<usize> = original_nodes.clone();
+                let mut seen: HashSet<usize> = HashSet::new();
                 let mut extras = 0usize;
-                for st in &detour_steps {
-                    if !seen.insert(st.node) {
+                for &(n, _, _, _) in path_to_target[1..]
+                    .iter()
+                    .chain(path_from_target[1..].iter())
+                {
+                    if original_nodes.contains(&n) || !seen.insert(n) {
                         extras += 1;
                     }
                 }
-
                 if extras > max_extra_revisits {
+                    continue;
+                }
+
+                // Build the detour and splice it in.
+                let mut detour: Vec<(usize, Side, u64, String)> = path_to_target;
+                detour.extend(path_from_target.into_iter().skip(1));
+                let detour_steps = path_to_steps(g, &detour);
+                if !detour_steps.iter().any(|s| s.node == target) {
                     continue;
                 }
 
                 let mut new_steps: Vec<Step> = walk.steps[..=i].to_vec();
                 new_steps.extend(detour_steps);
-                // Skip walk.steps[j] -- it's already the last detour step.
                 if j + 1 < walk.steps.len() {
                     new_steps.extend(walk.steps[(j + 1)..].iter().cloned());
                 }
-
                 let new_walk = Walk { steps: new_steps };
-
-                let included = new_walk.steps.iter().any(|s| s.node == target);
-                if !included {
-                    continue;
-                }
-
-                // Safety check: reject any walk that produces adjacent
-                // duplicate nodes or whose adjacent steps aren't connected
-                // by a real edge. This guards against any remaining splice
-                // edge-cases we haven't enumerated.
                 if !is_valid_walk(g, &new_walk) {
                     continue;
                 }
-
-                match &best {
-                    None => best = Some((new_walk, extras)),
-                    Some((_, prev_extras)) => {
-                        if extras < *prev_extras {
-                            best = Some((new_walk, extras));
-                        }
-                    }
-                }
+                return Some(new_walk);
             }
         }
     }
 
-    best.map(|(w, _)| w)
+    None
 }
 
 /// Try to extend a walk past its current end to pick up an uncovered node.
 /// This is a simpler variant of try_splice that only appends to the end of
 /// the walk. Useful when the walk currently terminates at an internal node
 /// because the algorithm decided to stop.
-fn try_extend_end(g: &Graph, walk: &Walk, target: usize, max_extra_revisits: usize) -> Option<Walk> {
+fn try_extend_end(
+    g: &Graph,
+    walk: &Walk,
+    target: usize,
+    max_extra_revisits: usize,
+    bfs_cache: &mut BfsCache,
+) -> Option<Walk> {
     let n_steps = walk.steps.len();
     if n_steps < 1 {
         return None;
     }
     let last = &walk.steps[n_steps - 1];
     let (_, exit) = entry_exit_for_orient(last.orient);
-    let parents = bfs_from(g, last.node, exit);
+    let parents = get_bfs(g, bfs_cache, last.node, exit);
     let original_nodes: HashSet<usize> = walk.steps.iter().map(|s| s.node).collect();
 
     let mut best: Option<(Walk, usize)> = None;
@@ -421,6 +421,10 @@ fn repair_coverage(
     // Hard iteration cap to guarantee termination even if something pathological happens.
     let mut iters = 0usize;
     let max_iters = members.len() * 4 + 16;
+    // BFS results are purely graph-derived; cache them for the lifetime of
+    // repair so they are shared across all target nodes, both walks, and all
+    // iterations without ever needing invalidation.
+    let mut bfs_cache: BfsCache = HashMap::new();
 
     loop {
         iters += 1;
@@ -442,58 +446,50 @@ fn repair_coverage(
             break;
         }
 
-        let cov_before_count = covered_before.len();
+        // Use bp (base-pair) coverage as the acceptance criterion rather than
+        // node count. A splice that removes many short nodes but adds fewer,
+        // longer nodes should be accepted since bp coverage increased even
+        // though node count fell.
+        let cov_before_bp: u64 = covered_before.iter().map(|&n| g.segs[n].length).sum();
 
-        // For each uncovered node, find the best splice option (if any) and
-        // remember the resulting (which_walk, new_walk, new_joint_coverage).
-        // Apply the single best splice this iteration.
-        let mut best: Option<(usize, usize, Walk, usize)> = None;
-        // (target_node, which_walk_index (0 or 1), new_walk, new_coverage_count)
-
-        for u in &uncovered {
+        // Try uncovered nodes in order; apply the first splice that strictly
+        // increases joint bp coverage and move on. Coverage is monotone
+        // (joint_bp only increases) so the loop cannot oscillate.
+        let mut applied = false;
+        'splice_search: for u in &uncovered {
             for which in 0..2usize {
                 let w_ref = if which == 0 { &w1 } else { &w2 };
-                let new_w_opt = try_splice(g, w_ref, *u, max_extra_revisits_per_node)
-                    .or_else(|| try_extend_end(g, w_ref, *u, max_extra_revisits_per_node));
+                let new_w_opt = try_splice(g, w_ref, *u, max_extra_revisits_per_node, &mut bfs_cache)
+                    .or_else(|| try_extend_end(g, w_ref, *u, max_extra_revisits_per_node, &mut bfs_cache));
                 if let Some(new_w) = new_w_opt {
-                    // Compute joint coverage if we replace which-th walk with new_w
                     let other = if which == 0 { &w2 } else { &w1 };
                     let joint: HashSet<usize> =
                         new_w.node_set().union(&other.node_set()).copied().collect();
-                    let joint_n = joint.len();
-                    // Only consider if joint coverage strictly improves.
-                    if joint_n > cov_before_count {
-                        let should_take = match &best {
-                            None => true,
-                            Some((_, _, _, best_n)) => joint_n > *best_n,
-                        };
-                        if should_take {
-                            best = Some((*u, which, new_w, joint_n));
+                    let joint_bp: u64 = joint.iter().map(|&n| g.segs[n].length).sum();
+                    if joint_bp > cov_before_bp {
+                        if verbose {
+                            let joint_nodes = joint.len();
+                            eprintln!(
+                                "    splice {} into w{} (bp {} -> {}, nodes {})",
+                                g.segs[*u].name,
+                                which + 1,
+                                cov_before_bp,
+                                joint_bp,
+                                joint_nodes,
+                            );
                         }
+                        if which == 0 { w1 = new_w; } else { w2 = new_w; }
+                        splices += 1;
+                        applied = true;
+                        break 'splice_search;
                     }
                 }
             }
         }
 
-        match best {
-            Some((target, which, new_w, joint_n)) => {
-                if verbose {
-                    eprintln!(
-                        "    splice {} into w{} (coverage {} -> {})",
-                        g.segs[target].name,
-                        which + 1,
-                        cov_before_count,
-                        joint_n
-                    );
-                }
-                if which == 0 {
-                    w1 = new_w;
-                } else {
-                    w2 = new_w;
-                }
-                splices += 1;
-            }
-            None => {
+        match applied {
+            true => {}
+            false => {
                 if verbose {
                     eprintln!(
                         "    coverage repair stalled with {} node(s) still uncovered",
