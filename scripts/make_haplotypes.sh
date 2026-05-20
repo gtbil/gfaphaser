@@ -3,22 +3,30 @@
 #SBATCH --mem=24GB               # maximum memory per node
 #SBATCH -p atlas                  # standard node(s)
 #SBATCH -J get_contigs
-#SBATCH --time 8:00:00
-#SBATCH --array=1-490
-
+#SBATCH --time 12:00:00
 # INHERIT ASM
-COMPONENT=$(printf "%03d" "$SLURM_ARRAY_TASK_ID")
+WIDTH=${#SLURM_ARRAY_TASK_MAX}
+COMPONENT=$(printf "%0${WIDTH}d" "$SLURM_ARRAY_TASK_ID")
 
 source /home/${USER}/.bashrc
+
+require_nonempty() {
+    local f="$1"
+    if [ ! -s "$f" ]; then
+        echo "[ERROR]: $f missing or empty" >&2
+        exit 1
+    fi
+}
 
 mkdir -p work/${ASM}/${COMPONENT}
 cd work/${ASM}/${COMPONENT}
 cp ../../../subgraphs/${ASM}/gfa/${ASM}.component_${COMPONENT}.gfa step01.gfa
 
 /home/${USER}/.pyenv/shims/python ../../../prune_to_spine.py step01.gfa step02.gfa --verbose
-[ ! -s step01.gfa ] && exit 1
+require_nonempty step02.gfa
 
 vg convert --gfa-in step02.gfa --packed-out > step02.vg
+require_nonempty step02.vg
 
 vg mod \
 	--compact-ids \
@@ -28,18 +36,19 @@ vg mod \
 	step02.vg \
 	| vg mod --unchop - \
 	> step03.vg
+require_nonempty step03.vg
 
 vg convert --gfa-out step03.vg > step03.gfa
-[ ! -s step03.gfa ] && exit 1
-
+require_nonempty step03.gfa
 
 /home/${USER}/.pyenv/shims/python ../../../prune_ports.py step03.gfa step04.gfa --verbose
-[ ! -s step04.gfa ] && exit 1
+require_nonempty step04.gfa
 
 /home/${USER}/.pyenv/shims/python ../../../prune_to_spine.py step04.gfa step05.gfa
-[ ! -s step05.gfa ] && exit 1
+require_nonempty step05.gfa
 
 vg convert --gfa-in step05.gfa --packed-out > step05.vg
+require_nonempty step05.vg
 
 vg mod \
 	--compact-ids \
@@ -50,22 +59,22 @@ vg mod \
 	step05.vg \
 	| vg mod --unchop - \
 	> step06.vg
+require_nonempty step06.vg
 
 vg convert --gfa-out step06.vg > step06.gfa
-[ ! -s step06.gfa ] && exit 1
+require_nonempty step06.gfa
 
 /home/${USER}/.pyenv/shims/python ../../../prune_ports.py step06.gfa step07.gfa --verbose
-[ ! -s step07.gfa ] && exit 1
+require_nonempty step07.gfa
 
 /home/${USER}/.pyenv/shims/python ../../../prune_to_spine.py step07.gfa step08.gfa --verbose
-[ ! -s step08.gfa ] && exit 1
+require_nonempty step08.gfa
 
 /home/${USER}/.pyenv/shims/python ../../../prune_ports.py step08.gfa step09.gfa --verbose
-[ ! -s step09.gfa ] && exit 1
+require_nonempty step09.gfa
 
 ../../../gfa_haps step09.gfa
-[ ! -s step09.with_paths.gfa ] && exit 1
-
+require_nonempty step09.with_paths.gfa
 
 # repair the path names
 sed -i "s/sample/${ASM}/g" step09.with_paths.gfa
