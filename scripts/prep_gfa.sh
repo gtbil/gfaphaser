@@ -9,6 +9,8 @@
 
 source /home/${USER}/.bashrc
 
+find ../ -type f -name ${ASM}.p_utg.gfa | xargs -I {} cp {} .
+
 ./get_blunted --provenance ${ASM}.p_utg.txt --threads 46 --verbose --input_gfa ${ASM}.p_utg.gfa > ${ASM}.gfa
 
 vg convert --gfa-in ${ASM}.gfa --packed-out > ${ASM}.vg
@@ -25,3 +27,7 @@ vg mod \
 	> ${ASM}.norm.vg
 
 vg convert --gfa-out ${ASM}.norm.vg > ${ASM}.norm.gfa
+
+mkdir -p subgraphs/${ASM}/gfa/
+mkdir -p subgraphs/${ASM}/gfa_walks
+./gfa_split ${ASM}.norm.gfa --out-prefix subgraphs/${ASM}/gfa/${ASM}
