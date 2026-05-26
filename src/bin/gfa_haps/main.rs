@@ -562,7 +562,7 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         eprintln!(
-            "usage: {} <input.gfa> [--algorithm NAME] [--endpoints tip|any] [--candidates K] [--seed S] [--sample NAME] [--skip-sequences] [--repair-max-revisits N] [--no-repair] [--verbose]",
+            "usage: {} <input.gfa> [--algorithm NAME] [--endpoints tip|any] [--candidates K] [--seed S] [--sample NAME] [--skip-sequences] [--length-tolerance R] [--repair-max-revisits N] [--no-repair] [--verbose]",
             args.get(0).map(|s| s.as_str()).unwrap_or("gfa_haps")
         );
         process::exit(2);
@@ -578,6 +578,7 @@ fn main() {
     let mut verbose = false;
     let mut repair_max_revisits: usize = 4;
     let mut no_repair = false;
+    let mut length_tolerance: f64 = 0.10;
 
     let mut i = 2;
     while i < args.len() {
@@ -642,6 +643,18 @@ fn main() {
             "--no-repair" => {
                 no_repair = true;
             }
+            "--length-tolerance" => {
+                i += 1;
+                if i >= args.len() {
+                    die("--length-tolerance needs a value");
+                }
+                length_tolerance = args[i]
+                    .parse()
+                    .unwrap_or_else(|_| die("--length-tolerance must be a number in [0, 1]"));
+                if length_tolerance < 0.0 || length_tolerance > 1.0 {
+                    die("--length-tolerance must be between 0.0 and 1.0");
+                }
+            }
             other => die(&format!("unknown argument: {}", other)),
         }
         i += 1;
@@ -669,8 +682,8 @@ fn main() {
     });
 
     let algorithm: Box<dyn WalkPairAlgorithm> = match algo_name.as_str() {
-        "diverse-pair" => Box::new(DiversePair { mode, k, seed }),
-        "divide-and-conquer" => Box::new(DivideAndConquer { mode, k, seed }),
+        "diverse-pair" => Box::new(DiversePair { mode, k, seed, max_length_ratio: length_tolerance }),
+        "divide-and-conquer" => Box::new(DivideAndConquer { mode, k, seed, max_length_ratio: length_tolerance }),
         other => die(&format!("unknown algorithm: {}", other)),
     };
 

@@ -335,6 +335,7 @@ pub struct DivideAndConquer {
     pub mode: EndpointMode,
     pub k: usize,
     pub seed: u64,
+    pub max_length_ratio: f64,
 }
 
 impl WalkPairAlgorithm for DivideAndConquer {
@@ -352,7 +353,7 @@ impl WalkPairAlgorithm for DivideAndConquer {
         macro_rules! fallback {
             () => {
                 best_pair_for_component(
-                    g, members, self.mode, self.k, comp_seed, None, verbose,
+                    g, members, self.mode, self.k, comp_seed, None, verbose, self.max_length_ratio,
                 )
             };
         }
@@ -409,6 +410,7 @@ impl WalkPairAlgorithm for DivideAndConquer {
                 subgraph_seed,
                 Some(&sub_set),
                 false, // suppress per-subgraph verbose pool dumps
+                1.0,   // no size filter for internal subgraph calls
             ) {
                 Some(pair) => pair,
                 None => {

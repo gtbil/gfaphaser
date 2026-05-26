@@ -333,6 +333,7 @@ pub fn best_pair_for_component(
     base_seed: u64,
     node_mask: Option<&HashSet<usize>>,
     verbose: bool,
+    max_length_ratio: f64,
 ) -> Option<(Walk, Walk)> {
     let mut pool = generate_candidates(g, members, mode, k, base_seed, node_mask);
     if pool.is_empty() {
@@ -383,30 +384,61 @@ pub fn best_pair_for_component(
             );
         }
     }
-    let mut best: Option<(usize, usize, PairScore)> = None;
-    for i in 0..pool.len() {
-        for j in (i + 1)..pool.len() {
-            let sc = pair_score(g, &pool[i], &pool[j]);
-            match best {
-                None => best = Some((i, j, sc)),
-                Some((_, _, bs)) => {
-                    if pair_better(sc, bs) {
-                        best = Some((i, j, sc));
-                    }
+    // Hap1 is fixed as the leader (pool[0], already sorted longest-first above).
+    // Hap2 is chosen from candidates whose length is within max_length_ratio of hap1.
+    if pool.len() == 1 {
+        return Some((pool[0].clone(), pool[0].clone()));
+    }
+
+    let hap1_len = pool[0].length_bp(g);
+    let len_lo = (hap1_len as f64 * (1.0 - max_length_ratio)).round() as u64;
+    let len_hi = (hap1_len as f64 * (1.0 + max_length_ratio)).round() as u64;
+
+    let similar: Vec<usize> = (1..pool.len())
+        .filter(|&j| {
+            let l = pool[j].length_bp(g);
+            l >= len_lo && l <= len_hi
+        })
+        .collect();
+
+    if verbose {
+        eprintln!(
+            "  hap1 len: {} bp  size filter: [{}, {}] bp ({:.0}%)",
+            hap1_len, len_lo, len_hi,
+            max_length_ratio * 100.0
+        );
+        eprintln!(
+            "  hap2 candidates: {} / {} pass size filter",
+            similar.len(),
+            pool.len().saturating_sub(1)
+        );
+    }
+
+    // Fall back to unrestricted pool if no size-similar candidates found.
+    let hap2_space: Vec<usize> = if !similar.is_empty() {
+        similar
+    } else {
+        eprintln!(
+            "  warn: no size-similar hap2 candidates (tolerance={:.0}%); using unrestricted pool",
+            max_length_ratio * 100.0
+        );
+        (1..pool.len()).collect()
+    };
+
+    let mut best_hap2: Option<(usize, PairScore)> = None;
+    for &j in &hap2_space {
+        let sc = pair_score(g, &pool[0], &pool[j]);
+        match best_hap2 {
+            None => best_hap2 = Some((j, sc)),
+            Some((_, bs)) => {
+                if pair_better(sc, bs) {
+                    best_hap2 = Some((j, sc));
                 }
-            }
-        }
-        // Also allow degenerate "pair with itself" only if pool has size 1
-        if pool.len() == 1 {
-            let sc = pair_score(g, &pool[i], &pool[i]);
-            match best {
-                None => best = Some((i, i, sc)),
-                Some(_) => {}
             }
         }
     }
 
-    best.map(|(i, j, _sc)| (pool[i].clone(), pool[j].clone()))
+    best_hap2.map(|(j, _)| (pool[0].clone(), pool[j].clone()))
 }
 
 // ------------ Algorithm implementation ------------
@@ -418,12 +450,16 @@ pub struct DiversePair {
     pub mode: EndpointMode,
     pub k: usize,
     pub seed: u64,
+    /// Maximum fractional length difference allowed for hap2 relative to hap1
+    /// (e.g. 0.10 = 10%). Filters out candidates seeded from internal tips that
+    /// produce much shorter or longer walks than hap1.
+    pub max_length_ratio: f64,
 }
 
 impl WalkPairAlgorithm for DiversePair {
     fn build_pair(&self, g: &Graph, members: &[usize], comp_idx: usize, verbose: bool) -> Option<(Walk, Walk)> {
         let comp_seed = self.seed
             .wrapping_add((comp_idx as u64).wrapping_mul(0x9E3779B97F4A7C15));
-        best_pair_for_component(g, members, self.mode, self.k, comp_seed, None, verbose)
+        best_pair_for_component(g, members, self.mode, self.k, comp_seed, None, verbose, self.max_length_ratio)
     }
 }
