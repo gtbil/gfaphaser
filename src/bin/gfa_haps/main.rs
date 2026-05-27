@@ -674,6 +674,8 @@ fn repair_coverage(
                     *walk = new_w;
                     *splices += 1;
                     *applied = true;
+                    return; // each new_w was built from the pre-iteration walk;
+                            // a second assignment would overwrite the first splice
                 }
             }
         };
