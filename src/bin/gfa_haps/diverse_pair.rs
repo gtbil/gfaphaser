@@ -9,6 +9,7 @@
 //   3. minimize total revisits
 
 use gfaphaser::{Edge, Graph, Side, Step, Walk};
+use rayon::prelude::*;
 use std::collections::HashSet;
 use super::WalkPairAlgorithm;
 
@@ -244,28 +245,24 @@ fn generate_candidates(
         return Vec::new();
     }
 
-    let mut pool: Vec<Walk> = Vec::with_capacity(k);
-
     // Mix of revisit budgets: try strict simple-path walks (0 revisits) AND
     // walks with small budgets that can dip back to grab extra coverage.
     let revisit_budgets: [usize; 4] = [0, 1, 3, 8];
 
-    let mut seed_counter: u64 = 0;
-    for trial in 0..k {
-        let budget = revisit_budgets[trial % revisit_budgets.len()];
-        let start_idx = trial % starts.len();
-        let (sn, se) = starts[start_idx];
-
-        let mut rng = Rng::new(
-            base_seed
-                .wrapping_add(seed_counter)
-                .wrapping_mul(0x100000001B3),
-        );
-        seed_counter = seed_counter.wrapping_add(1);
-
-        let walk = generate_walk(g, sn, se, &mut rng, budget, None, 1.0, node_mask);
-        pool.push(walk);
-    }
+    // Each walk's seed is a closed-form function of its trial index, so
+    // parallel execution produces bit-identical results to sequential.
+    let pool: Vec<Walk> = (0..k)
+        .into_par_iter()
+        .map(|trial| {
+            let budget = revisit_budgets[trial % revisit_budgets.len()];
+            let (sn, se) = starts[trial % starts.len()];
+            let seed = base_seed
+                .wrapping_add(trial as u64)
+                .wrapping_mul(0x100000001B3);
+            let mut rng = Rng::new(seed);
+            generate_walk(g, sn, se, &mut rng, budget, None, 1.0, node_mask)
+        })
+        .collect(); // IndexedParallelIterator preserves trial order
 
     // Dedup by node-multiset signature.
     let mut seen_sigs: HashSet<Vec<usize>> = HashSet::new();
@@ -351,21 +348,33 @@ pub fn best_pair_for_component(
     if starts.is_empty() {
         starts = walk_starts(g, members, EndpointMode::Any);
     }
-    let mut comp_seed: u64 = base_seed ^ 0xA5A5_5A5A_DEAD_BEEF;
     let comp_count = k; // same budget for complements
     let revisit_budgets: [usize; 4] = [0, 1, 3, 8];
     let global_avoid_weights: [f64; 4] = [4.0, 16.0, 64.0, 256.0];
-    for trial in 0..comp_count {
-        let budget = revisit_budgets[trial % revisit_budgets.len()];
-        let gw = global_avoid_weights[trial % global_avoid_weights.len()];
-        let (sn, se) = starts[trial % starts.len()];
-        let mut rng = Rng::new(comp_seed);
-        comp_seed = comp_seed
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        let w = generate_walk(g, sn, se, &mut rng, budget, Some(&leader_nodes), gw, node_mask);
-        pool.push(w);
+    // Pre-compute the full LCG seed chain so each walk gets the same seed
+    // it would have received in the sequential loop, enabling parallel generation.
+    let mut lcg_seeds: Vec<u64> = Vec::with_capacity(comp_count);
+    {
+        let mut s: u64 = base_seed ^ 0xA5A5_5A5A_DEAD_BEEF;
+        for _ in 0..comp_count {
+            lcg_seeds.push(s);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+        }
     }
+    let comp_walks: Vec<Walk> = lcg_seeds
+        .into_par_iter()
+        .enumerate()
+        .map(|(trial, seed)| {
+            let budget = revisit_budgets[trial % revisit_budgets.len()];
+            let gw = global_avoid_weights[trial % global_avoid_weights.len()];
+            let (sn, se) = starts[trial % starts.len()];
+            let mut rng = Rng::new(seed);
+            generate_walk(g, sn, se, &mut rng, budget, Some(&leader_nodes), gw, node_mask)
+        })
+        .collect(); // index order preserved
+    pool.extend(comp_walks);
 
     // Evaluate all pairs (ordered as the canonical (smaller_idx, larger_idx)).
     if verbose {
@@ -425,18 +434,17 @@ pub fn best_pair_for_component(
         (1..pool.len()).collect()
     };
 
-    let mut best_hap2: Option<(usize, PairScore)> = None;
-    for &j in &hap2_space {
-        let sc = pair_score(g, &pool[0], &pool[j]);
-        match best_hap2 {
-            None => best_hap2 = Some((j, sc)),
-            Some((_, bs)) => {
-                if pair_better(sc, bs) {
-                    best_hap2 = Some((j, sc));
-                }
-            }
-        }
-    }
+    // pair_better defines a total order, so parallel max-reduction gives the
+    // same winner regardless of evaluation order.
+    let best_hap2: Option<(usize, PairScore)> = hap2_space
+        .par_iter()
+        .map(|&j| {
+            let sc = pair_score(g, &pool[0], &pool[j]);
+            (j, sc)
+        })
+        .reduce_with(|(ja, sa), (jb, sb)| {
+            if pair_better(sb, sa) { (jb, sb) } else { (ja, sa) }
+        });
 
     best_hap2.map(|(j, _)| (pool[0].clone(), pool[j].clone()))
 }

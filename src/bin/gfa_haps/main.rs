@@ -25,7 +25,9 @@ mod diverse_pair;
 mod divide_and_conquer;
 
 use diverse_pair::{pair_score, DiversePair, EndpointMode, PairScore};
-use divide_and_conquer::DivideAndConquer;
+use divide_and_conquer::{collect_subgraph_nodes, find_anchors, order_anchors, DivideAndConquer};
+use rayon;
+use rayon::prelude::*;
 use gfaphaser::{
     connected_components, entry_exit_for_orient, halfedge, parse_gfa, Graph, ParseOptions,
     Side, Step, Walk,
@@ -343,6 +345,106 @@ fn try_splice(
     None
 }
 
+/// Segment-restricted splice: same logic as try_splice but only scans (i, j)
+/// pairs within [i_lo, i_hi]. Creates its own BfsCache so it can run on a
+/// separate thread without sharing state with other segment tasks.
+fn try_splice_in_range(
+    g: &Graph,
+    walk: &Walk,
+    target: usize,
+    max_extra_revisits: usize,
+    i_lo: usize,
+    i_hi: usize,
+) -> Option<Walk> {
+    if i_hi <= i_lo {
+        return None;
+    }
+    let n_steps = walk.steps.len();
+    if n_steps < 2 || i_lo >= n_steps || i_hi >= n_steps {
+        return None;
+    }
+
+    let original_nodes: HashSet<usize> = walk.steps.iter().map(|s| s.node).collect();
+    let mut bfs_cache: BfsCache = HashMap::new();
+
+    let reachable_j: [HashSet<usize>; 2] = [0u8, 1u8].map(|te| {
+        let parents_from_t = get_bfs(g, &mut bfs_cache, target, 1 - te);
+        ((i_lo + 1)..=i_hi)
+            .filter(|&j| {
+                let (b_node, b_entry) = entry_state_of(walk, j);
+                parents_from_t[halfedge(b_node, 1 - b_entry)].is_some()
+            })
+            .collect::<HashSet<usize>>()
+    });
+
+    if reachable_j[0].is_empty() && reachable_j[1].is_empty() {
+        return None;
+    }
+
+    let range_len = i_hi - i_lo;
+    for gap in 1..=range_len {
+        for i in i_lo..(i_hi + 1 - gap) {
+            let j = i + gap;
+            for target_entry in [0u8, 1u8] {
+                if !reachable_j[target_entry as usize].contains(&j) {
+                    continue;
+                }
+                let (a_node, a_exit) = exit_state_after(walk, i);
+                let parents_fwd = get_bfs(g, &mut bfs_cache, a_node, a_exit);
+                let target_exit_state = halfedge(target, 1 - target_entry);
+                if parents_fwd[target_exit_state].is_none() {
+                    continue;
+                }
+
+                let path_to_target = match reconstruct_path(&parents_fwd, target_exit_state) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let parents_from_t = get_bfs(g, &mut bfs_cache, target, 1 - target_entry);
+                let (b_node, b_entry) = entry_state_of(walk, j);
+                let target_he = halfedge(b_node, 1 - b_entry);
+                let path_from_target = match reconstruct_path(&parents_from_t, target_he) {
+                    Some(p) => p,
+                    None => continue,
+                };
+
+                let mut seen: HashSet<usize> = HashSet::new();
+                let mut extras = 0usize;
+                for &(n, _, _, _) in path_to_target[1..]
+                    .iter()
+                    .chain(path_from_target[1..].iter())
+                {
+                    if original_nodes.contains(&n) || !seen.insert(n) {
+                        extras += 1;
+                    }
+                }
+                if extras > max_extra_revisits {
+                    continue;
+                }
+
+                let mut detour: Vec<(usize, Side, u64, String)> = path_to_target;
+                detour.extend(path_from_target.into_iter().skip(1));
+                let detour_steps = path_to_steps(g, &detour);
+                if !detour_steps.iter().any(|s| s.node == target) {
+                    continue;
+                }
+
+                let mut new_steps: Vec<Step> = walk.steps[..=i].to_vec();
+                new_steps.extend(detour_steps);
+                if j + 1 < walk.steps.len() {
+                    new_steps.extend(walk.steps[(j + 1)..].iter().cloned());
+                }
+                let new_walk = Walk { steps: new_steps };
+                if !is_valid_walk(g, &new_walk) {
+                    continue;
+                }
+                return Some(new_walk);
+            }
+        }
+    }
+    None
+}
+
 /// Try to extend a walk past its current end to pick up an uncovered node.
 /// This is a simpler variant of try_splice that only appends to the end of
 /// the walk. Useful when the walk currently terminates at an internal node
@@ -403,10 +505,15 @@ fn try_extend_end(
 }
 
 /// Repair coverage for a pair of walks. Tries to add each uncovered node
-/// into one of the two walks via try_splice or try_extend_end, choosing the
-/// option that yields the highest *joint* coverage afterward. Splices are
-/// only accepted if they strictly increase joint coverage, preventing
-/// flip-flops where splicing one node evicts another.
+/// into one of the two walks via try_splice or try_extend_end. Splices are
+/// only accepted if they strictly increase joint bp coverage.
+///
+/// The component is partitioned into bubble segments at anchor (cut-vertex)
+/// nodes. Within each segment the splice search is restricted to the walk
+/// steps between that segment's bounding anchors — reducing the O(L²) scan
+/// to O(segment_len²) — and segments are searched in parallel. Uncovered
+/// nodes not assigned to any segment fall back to the original sequential
+/// full-walk scan.
 fn repair_coverage(
     g: &Graph,
     members: &[usize],
@@ -418,12 +525,42 @@ fn repair_coverage(
     let mut w1 = w1;
     let mut w2 = w2;
     let mut splices = 0usize;
-    // Hard iteration cap to guarantee termination even if something pathological happens.
     let mut iters = 0usize;
     let max_iters = members.len() * 4 + 16;
-    // BFS results are purely graph-derived; cache them for the lifetime of
-    // repair so they are shared across all target nodes, both walks, and all
-    // iterations without ever needing invalidation.
+
+    // Compute anchor structure once for the lifetime of repair.
+    // Anchors are the cut-vertex nodes every walk must pass through; they
+    // define the segment boundaries for the parallel splice search.
+    let member_set: HashSet<usize> = members.iter().copied().collect();
+    let anchor_set = find_anchors(g, members, &member_set);
+    let ordered: Vec<usize> = if anchor_set.len() >= 2 {
+        order_anchors(g, members, &anchor_set, &member_set)
+    } else {
+        Vec::new()
+    };
+    let n_segs = ordered.len().saturating_sub(1);
+
+    // Pre-compute the node set for each segment (between consecutive anchors).
+    let seg_node_sets: Vec<HashSet<usize>> = (0..n_segs)
+        .map(|k| {
+            collect_subgraph_nodes(g, &member_set, ordered[k], ordered[k + 1])
+                .into_iter()
+                .collect()
+        })
+        .collect();
+
+    // Map each node to the first segment that contains it.
+    let node_to_seg: HashMap<usize, usize> = {
+        let mut m: HashMap<usize, usize> = HashMap::new();
+        for (k, set) in seg_node_sets.iter().enumerate() {
+            for &n in set {
+                m.entry(n).or_insert(k);
+            }
+        }
+        m
+    };
+
+    // Fallback BFS cache for the sequential path (unsegmented nodes, extend_end).
     let mut bfs_cache: BfsCache = HashMap::new();
 
     loop {
@@ -446,66 +583,193 @@ fn repair_coverage(
             break;
         }
 
-        // Use bp (base-pair) coverage as the acceptance criterion rather than
-        // node count. A splice that removes many short nodes but adds fewer,
-        // longer nodes should be accepted since bp coverage increased even
-        // though node count fell.
         let cov_before_bp: u64 = covered_before.iter().map(|&n| g.segs[n].length).sum();
 
-        // Try uncovered nodes in order; apply the first splice that strictly
-        // increases joint bp coverage and move on. Coverage is monotone
-        // (joint_bp only increases) so the loop cannot oscillate.
-        let mut applied = false;
-        'splice_search: for u in &uncovered {
-            for which in 0..2usize {
-                let w_ref = if which == 0 { &w1 } else { &w2 };
-                let new_w_opt = try_splice(g, w_ref, *u, max_extra_revisits_per_node, &mut bfs_cache)
-                    .or_else(|| try_extend_end(g, w_ref, *u, max_extra_revisits_per_node, &mut bfs_cache));
-                if let Some(new_w) = new_w_opt {
-                    let other = if which == 0 { &w2 } else { &w1 };
-                    let joint: HashSet<usize> =
-                        new_w.node_set().union(&other.node_set()).copied().collect();
-                    let joint_bp: u64 = joint.iter().map(|&n| g.segs[n].length).sum();
-                    if joint_bp > cov_before_bp {
-                        if verbose {
-                            let joint_nodes = joint.len();
-                            eprintln!(
-                                "    splice {} into w{} (bp {} -> {}, nodes {})",
-                                g.segs[*u].name,
-                                which + 1,
-                                cov_before_bp,
-                                joint_bp,
-                                joint_nodes,
-                            );
+        // Partition uncovered nodes: segmented (fast parallel path) vs. the rest.
+        let mut by_seg: Vec<Vec<usize>> = vec![Vec::new(); n_segs];
+        let mut unsegmented: Vec<usize> = Vec::new();
+        for &u in &uncovered {
+            match node_to_seg.get(&u) {
+                Some(&k) => by_seg[k].push(u),
+                None => unsegmented.push(u),
+            }
+        }
+
+        // Precompute anchor step positions in each walk for this iteration.
+        // Must recompute each iteration because prior splices shift step indices.
+        let anchor_pos: [HashMap<usize, usize>; 2] = [&w1, &w2].map(|w| {
+            ordered
+                .iter()
+                .filter_map(|&a| w.steps.iter().position(|s| s.node == a).map(|p| (a, p)))
+                .collect()
+        });
+        // For segment k of walk `which`, return (i_lo, i_hi) step bounds or None.
+        let seg_range = |which: usize, k: usize| -> Option<(usize, usize)> {
+            if k + 1 >= ordered.len() {
+                return None;
+            }
+            let pos = &anchor_pos[which];
+            let p = *pos.get(&ordered[k])?;
+            let q = *pos.get(&ordered[k + 1])?;
+            if p < q { Some((p, q)) } else { None }
+        };
+
+        // Precompute step ranges into plain Vecs so the parallel closure captures
+        // only Send data (not the seg_range closure which references non-Send locals).
+        let w1_ranges: Vec<Option<(usize, usize)>> =
+            (0..n_segs).map(|k| seg_range(0, k)).collect();
+        let w2_ranges: Vec<Option<(usize, usize)>> =
+            (0..n_segs).map(|k| seg_range(1, k)).collect();
+
+        // === Parallel segment splice search ===
+        // Each task handles one segment: tries uncovered nodes in that segment
+        // (in order) until a splice is found. Returns (which_walk, i_lo, new_walk).
+        let candidates: Vec<(usize, usize, Walk)> = (0..n_segs)
+            .into_par_iter()
+            .filter_map(|k| {
+                if by_seg[k].is_empty() {
+                    return None;
+                }
+                let ranges = [w1_ranges[k], w2_ranges[k]];
+                for &u in &by_seg[k] {
+                    for which in 0..2usize {
+                        if let Some((i_lo, i_hi)) = ranges[which] {
+                            let walk = if which == 0 { &w1 } else { &w2 };
+                            if let Some(new_w) = try_splice_in_range(
+                                g, walk, u, max_extra_revisits_per_node, i_lo, i_hi,
+                            ) {
+                                return Some((which, i_lo, new_w));
+                            }
                         }
-                        if which == 0 { w1 = new_w; } else { w2 = new_w; }
-                        splices += 1;
-                        applied = true;
-                        break 'splice_search;
+                    }
+                }
+                None
+            })
+            .collect();
+
+        // === Apply candidates ===
+        // Separate by which walk, sort descending by i_lo so that when multiple
+        // splices land on the same walk the highest-indexed one is applied first
+        // (preserving the step-index validity of lower-indexed splices).
+        let mut applied = false;
+
+        let apply_cands = |walk: &mut Walk,
+                           other: &Walk,
+                           cands: &mut Vec<(usize, Walk)>,
+                           splices: &mut usize,
+                           applied: &mut bool,
+                           verbose: bool| {
+            cands.sort_by(|a, b| b.0.cmp(&a.0));
+            for (_, new_w) in cands.drain(..) {
+                let joint: HashSet<usize> =
+                    new_w.node_set().union(&other.node_set()).copied().collect();
+                let joint_bp: u64 = joint.iter().map(|&n| g.segs[n].length).sum();
+                if joint_bp > cov_before_bp {
+                    if verbose {
+                        eprintln!(
+                            "    segmented splice into w (bp {} -> {}, nodes {})",
+                            cov_before_bp, joint_bp, joint.len()
+                        );
+                    }
+                    *walk = new_w;
+                    *splices += 1;
+                    *applied = true;
+                }
+            }
+        };
+
+        let mut w1_cands: Vec<(usize, Walk)> = candidates
+            .iter()
+            .filter(|(which, _, _)| *which == 0)
+            .map(|(_, i_lo, w)| (*i_lo, w.clone()))
+            .collect();
+        let mut w2_cands: Vec<(usize, Walk)> = candidates
+            .iter()
+            .filter(|(which, _, _)| *which == 1)
+            .map(|(_, i_lo, w)| (*i_lo, w.clone()))
+            .collect();
+
+        // Apply w1 splices, then w2 splices. For the w2 coverage check we use
+        // the already-updated w1 (monotone: can only help, never hurt).
+        apply_cands(&mut w1, &w2, &mut w1_cands, &mut splices, &mut applied, verbose);
+        apply_cands(&mut w2, &w1, &mut w2_cands, &mut splices, &mut applied, verbose);
+
+        // === Fallback: sequential full-walk scan for unsegmented nodes ===
+        if !applied {
+            'splice_search: for u in &unsegmented {
+                for which in 0..2usize {
+                    let w_ref = if which == 0 { &w1 } else { &w2 };
+                    let new_w_opt =
+                        try_splice(g, w_ref, *u, max_extra_revisits_per_node, &mut bfs_cache)
+                            .or_else(|| {
+                                try_extend_end(
+                                    g, w_ref, *u, max_extra_revisits_per_node, &mut bfs_cache,
+                                )
+                            });
+                    if let Some(new_w) = new_w_opt {
+                        let other = if which == 0 { &w2 } else { &w1 };
+                        let joint: HashSet<usize> =
+                            new_w.node_set().union(&other.node_set()).copied().collect();
+                        let joint_bp: u64 = joint.iter().map(|&n| g.segs[n].length).sum();
+                        if joint_bp > cov_before_bp {
+                            if verbose {
+                                eprintln!(
+                                    "    splice {} into w{} (bp {} -> {}, nodes {})",
+                                    g.segs[*u].name,
+                                    which + 1,
+                                    cov_before_bp,
+                                    joint_bp,
+                                    joint.len(),
+                                );
+                            }
+                            if which == 0 { w1 = new_w; } else { w2 = new_w; }
+                            splices += 1;
+                            applied = true;
+                            break 'splice_search;
+                        }
                     }
                 }
             }
         }
 
-        match applied {
-            true => {}
-            false => {
-                if verbose {
-                    eprintln!(
-                        "    coverage repair stalled with {} node(s) still uncovered",
-                        uncovered.len()
-                    );
+        // === Fallback: try_extend_end for any still-uncovered segmented nodes ===
+        // Handles nodes whose segment anchors weren't found in the walk.
+        if !applied {
+            'ext_search: for &u in &uncovered {
+                for which in 0..2usize {
+                    let w_ref = if which == 0 { &w1 } else { &w2 };
+                    if let Some(new_w) =
+                        try_extend_end(g, w_ref, u, max_extra_revisits_per_node, &mut bfs_cache)
+                    {
+                        let other = if which == 0 { &w2 } else { &w1 };
+                        let joint: HashSet<usize> =
+                            new_w.node_set().union(&other.node_set()).copied().collect();
+                        let joint_bp: u64 = joint.iter().map(|&n| g.segs[n].length).sum();
+                        if joint_bp > cov_before_bp {
+                            if which == 0 { w1 = new_w; } else { w2 = new_w; }
+                            splices += 1;
+                            applied = true;
+                            break 'ext_search;
+                        }
+                    }
                 }
-                break;
             }
+        }
+
+        if !applied {
+            if verbose {
+                eprintln!(
+                    "    coverage repair stalled with {} node(s) still uncovered",
+                    uncovered.len()
+                );
+            }
+            break;
         }
     }
 
     let final_uncovered = members
         .iter()
-        .filter(|u| {
-            !w1.node_set().contains(u) && !w2.node_set().contains(u)
-        })
+        .filter(|u| !w1.node_set().contains(u) && !w2.node_set().contains(u))
         .count();
     (w1, w2, splices, final_uncovered)
 }
@@ -562,7 +826,7 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         eprintln!(
-            "usage: {} <input.gfa> [--algorithm NAME] [--endpoints tip|any] [--candidates K] [--seed S] [--sample NAME] [--skip-sequences] [--length-tolerance R] [--repair-max-revisits N] [--no-repair] [--verbose]",
+            "usage: {} <input.gfa> [--algorithm NAME] [--endpoints tip|any] [--candidates K] [--seed S] [--sample NAME] [--skip-sequences] [--length-tolerance R] [--repair-max-revisits N] [--no-repair] [--threads N] [--verbose]",
             args.get(0).map(|s| s.as_str()).unwrap_or("gfa_haps")
         );
         process::exit(2);
@@ -579,6 +843,7 @@ fn main() {
     let mut repair_max_revisits: usize = 4;
     let mut no_repair = false;
     let mut length_tolerance: f64 = 0.10;
+    let mut threads: usize = 0; // 0 = let rayon choose (all available cores)
 
     let mut i = 2;
     while i < args.len() {
@@ -655,9 +920,28 @@ fn main() {
                     die("--length-tolerance must be between 0.0 and 1.0");
                 }
             }
+            "--threads" => {
+                i += 1;
+                if i >= args.len() {
+                    die("--threads needs a value");
+                }
+                threads = args[i]
+                    .parse()
+                    .unwrap_or_else(|_| die("--threads must be a positive integer"));
+                if threads == 0 {
+                    die("--threads must be >= 1");
+                }
+            }
             other => die(&format!("unknown argument: {}", other)),
         }
         i += 1;
+    }
+
+    if threads > 0 {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build_global()
+            .unwrap_or_else(|e| die(&format!("failed to build thread pool: {}", e)));
     }
 
     let opts = ParseOptions {

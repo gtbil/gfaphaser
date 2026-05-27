@@ -30,7 +30,7 @@ use super::diverse_pair::{best_pair_for_component, pair_better, pair_score, Endp
 
 /// Undirected BFS from `start` within `member_set`. Visits `barrier` but
 /// does not expand through it, so nodes "beyond" the barrier are excluded.
-fn bfs_reachable_set(
+pub(super) fn bfs_reachable_set(
     g: &Graph,
     start: usize,
     barrier: usize,
@@ -91,7 +91,7 @@ fn bfs_reachable(
 /// the component's reference tips (tip_a, tip_b). Both tips are included.
 /// Returns an empty set when there are fewer than 2 tips (no useful
 /// decomposition possible).
-fn find_anchors(g: &Graph, members: &[usize], member_set: &HashSet<usize>) -> HashSet<usize> {
+pub(super) fn find_anchors(g: &Graph, members: &[usize], member_set: &HashSet<usize>) -> HashSet<usize> {
     let tips: Vec<usize> = members
         .iter()
         .copied()
@@ -119,7 +119,7 @@ fn find_anchors(g: &Graph, members: &[usize], member_set: &HashSet<usize>) -> Ha
 // ------------ Stage 2: order anchors ------------
 
 /// BFS from a tip anchor; record anchors in the order they are first visited.
-fn order_anchors(
+pub(super) fn order_anchors(
     g: &Graph,
     members: &[usize],
     anchors: &HashSet<usize>,
@@ -159,7 +159,7 @@ fn order_anchors(
 /// Nodes that lie between a_start and a_end: intersection of the set
 /// reachable from a_start (without passing through a_end) and the set
 /// reachable from a_end (without passing through a_start).
-fn collect_subgraph_nodes(
+pub(super) fn collect_subgraph_nodes(
     g: &Graph,
     member_set: &HashSet<usize>,
     a_start: usize,
